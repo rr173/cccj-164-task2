@@ -16,7 +16,7 @@ python3 -m quota.http_server --port 8765 --db ./quota.db
 # 打开 http://localhost:8765/ 即为租约控制台
 ```
 
-跑测试（功能 / 并发 / 到期 / 离线 / 重启重建 / 账本篡改，共 70 项）：
+跑测试（功能 / 并发 / 到期 / 离线 / 续约 / 重启重建 / 账本篡改，共 147 项）：
 
 ```bash
 python3 test_service.py
@@ -46,7 +46,8 @@ HTTP (http_server.py)
 | `LeaseGranted` | 父子节点间授予一条租约 |
 | `UsageRecorded` | 幂等用量回执，按 `usage_event_id` 去重 |
 | `LeaseExpired` | 租约到期，标记 `pending_expired`（不动余额） |
-| `LeaseClosed` | 结算租约，退回未消费余量 |
+| `LeaseAmended` | 修订有效期：截止时间延后，租约修订号 +1（不动余额） |
+| `LeaseClosed` | 结算租约，退回未消费余量（修订号同样 +1） |
 | `ClientPresenceChanged` | 客户端上 / 下线 |
 
 每条事件带 `prev_hash/event_hash`（SHA-256 链）与所属 `command_id`，
@@ -81,6 +82,32 @@ HTTP (http_server.py)
 这样中间层到期永远不会引发跨层超卖；重启后待结算租约会在重放+sweep 时
 继续走完结算。
 
+### 有效期修订（续约）与乐观修订号
+
+每条租约带一个单调递增的 **revision（修订号）**：授予即为 `0`，任何成功
+的状态变更都让它 `+1`（`LeaseAmended` 与 `LeaseClosed` 都推进版本）。
+持有人为**仍在生效**的租约提交它所看到的 `expected_revision` 与一个更晚
+的截止时间，服务端在锁内校验：
+
+- `expected_revision == 当前修订号`，且新截止时间**严格晚于**当前截止时间；
+- 租约必须 `active`（已 `closed`、或到期 `pending_expired` 等待结算都拒绝）；
+- 持有人是已下线客户端时拒绝；
+- 永久租约（授予时无 TTL）不能修订。
+
+满足则追加一条 `LeaseAmended`（只改时间，不动任何余额），修订号递增。
+冲突返回 `409` 并在 `details` 中回传租约最新状态（`current_revision` /
+`expires_at` / `status`），失败方据此重试即可。截止时间二选一：
+`extend_seconds`（在**当前截止时间**之上顺延的增量）或绝对
+`new_expires_at`（Unix 时间戳）。
+
+修订与**归还 / 撤销 / 用量**共享同一个版本号：这些命令都可携带
+`expected_revision` 做乐观并发。因此「续约」与「归还」同时发生时，在锁内
+只有一个变更能追加进事件账本，另一方必然收到 `409` 并看到最新状态
+（不带 `expected_revision` 的旧调用保持原有行为，向后兼容）。相同
+`command_id` 的重试由幂等命令表重放**第一次**的结果，包括返回过的截止时间，
+不会因相对延长量而重新计算。修订号、截止时间与修订历史都只存在于事件账本，
+重启重放后完整恢复。
+
 ### 防超卖 / 一致性的四道防线
 
 1. **进程内串行**：所有命令在同一把锁内“到期结算 → 去重 → 校验 → 原子提交”；
@@ -101,8 +128,9 @@ HTTP (http_server.py)
 | `POST /api/capacity` | `{capacity}` 调整容量（低于“已承诺/消费下限”拒绝） |
 | `POST /api/leases` | `{lessor_id, holder_id, amount, ttl_seconds?}` 申请租约 |
 | `POST /api/leases/usage` | `{lease_id, amount, usage_event_id}` 幂等扣减 |
-| `POST /api/leases/release` | `{lease_id}` 归还（释放未消费） |
-| `POST /api/leases/revoke` | `{lease_id}` 父级撤销 / 缩容 |
+| `POST /api/leases/amend` | `{lease_id, expected_revision, extend_seconds}` 或 `{…, new_expires_at}` 修订有效期 |
+| `POST /api/leases/release` | `{lease_id, expected_revision?}` 归还（释放未消费） |
+| `POST /api/leases/revoke` | `{lease_id, expected_revision?}` 父级撤销 / 缩容 |
 | `POST /api/clients/presence` | `{client_id, online}` 上 / 下线 |
 | `GET /api/state` | 全量节点余额 + 租约视图 |
 | `GET /api/audit` | 一致性审计（见下） |
@@ -130,4 +158,4 @@ HTTP (http_server.py)
 | `quota/service.py` | 命令执行 / 幂等 / 重建 / 后台 sweep / 审计 |
 | `quota/http_server.py` | HTTP 路由与静态页面 |
 | `static/index.html` | 租约控制台（节点树、租约操作、审计、账本） |
-| `test_service.py` | 70 项端到端测试（含真实重启与并发） |
+| `test_service.py` | 147 项端到端测试（含真实重启、并发与续约竞争） |

@@ -212,7 +212,7 @@
           <tr>
             <th>租约</th><th>父级 → 子级</th>
             <th class="num">授予</th><th class="num">已消费</th><th class="num">剩余</th>
-            <th class="num">剩余时间</th><th>状态</th><th>操作</th>
+            <th class="num">剩余时间</th><th class="num">修订号</th><th>状态</th><th>操作</th>
           </tr>
         </thead>
         <tbody></tbody>
@@ -256,7 +256,11 @@ async function api(path, body) {
         body: JSON.stringify(body) };
   const res = await fetch(path, opt);
   const data = await res.json().catch(() => ({}));
-  if (!res.ok) throw new Error((data && data.message) || (res.status + " " + res.statusText));
+  if (!res.ok) {
+    const err = new Error((data && data.message) || (res.status + " " + res.statusText));
+    err.details = data && data.details;
+    throw err;
+  }
   return data;
 }
 
@@ -380,7 +384,7 @@ function renderLeases(s) {
   const tb = $("#lease-table tbody");
   tb.innerHTML = "";
   if (!s.leases.length) {
-    tb.innerHTML = '<tr><td colspan="8" class="empty">还没有租约。在上方为合法父子对授予一条。</td></tr>';
+    tb.innerHTML = '<tr><td colspan="9" class="empty">还没有租约。在上方为合法父子对授予一条。</td></tr>';
     return;
   }
   s.leases.slice().reverse().forEach((l) => {
@@ -395,6 +399,7 @@ function renderLeases(s) {
     tr.appendChild(td(l.status === "active"
       ? (l.seconds_remaining === null ? "∞" : l.seconds_remaining + "s")
       : (l.closed_at ? fmtTime(l.closed_at) : "–"), "num"));
+    tr.appendChild(td(l.revision ?? 0, "num"));
     const st = document.createElement("td");
     const pill = document.createElement("span");
     const pillCls = l.status === "closed" ? l.reason : l.status;
@@ -424,15 +429,44 @@ function renderLeases(s) {
         if (!amount || amount < 1) return toast("请输入用量", false);
         try {
           const r = await api("/api/leases/usage",
-            { lease_id: l.id, amount, usage_event_id: uid("evt") });
+            { lease_id: l.id, amount, usage_event_id: uid("evt"), expected_revision: l.revision });
           toast(`扣减 ${amount} 成功（回执 ${r.usage_event_id}）`); refreshAll();
         } catch (e) { toast(e.message, false); }
       };
       wrap.appendChild(useBtn);
+
+      // 有效期修订：提交当前修订号 + 延后秒数；失败提示带上最新修订号
+      if (l.expires_at !== null) {
+        const ext = document.createElement("input");
+        ext.type = "number"; ext.min = "1"; ext.placeholder = "延后秒数";
+        wrap.appendChild(ext);
+        const amend = document.createElement("button");
+        amend.className = "warn"; amend.textContent = "续约";
+        amend.onclick = async () => {
+          const extend = parseInt(ext.value, 10);
+          if (!extend || extend < 1) return toast("请输入要延后的秒数", false);
+          try {
+            const r = await api("/api/leases/amend", {
+              lease_id: l.id, expected_revision: l.revision, extend_seconds: extend,
+              command_id: uid("amend"),
+            });
+            toast(`续约成功：修订号 ${l.revision} → ${r.revision}，截止时间延后 ${extend}s`);
+            refreshAll();
+          } catch (e) {
+            const d = e.details;
+            if (d && d.current_revision !== undefined)
+              toast(`${e.message}（最新修订号 ${d.current_revision}，状态 ${d.status}）`, false);
+            else toast(e.message, false);
+          }
+        };
+        wrap.appendChild(amend);
+      }
+
       const rel = document.createElement("button");
       rel.className = "ghost"; rel.textContent = "归还";
       rel.onclick = async () => {
-        try { const r = await api("/api/leases/release", { lease_id: l.id });
+        try { const r = await api("/api/leases/release",
+          { lease_id: l.id, expected_revision: l.revision });
           toast(`归还成功，释放未消费 ${r.released_amount}，已消费 ${r.consumed_amount} 保留`); refreshAll(); }
         catch (e) { toast(e.message, false); }
       };
@@ -440,7 +474,8 @@ function renderLeases(s) {
       const rev = document.createElement("button");
       rev.className = "danger"; rev.textContent = "撤销";
       rev.onclick = async () => {
-        try { const r = await api("/api/leases/revoke", { lease_id: l.id });
+        try { const r = await api("/api/leases/revoke",
+          { lease_id: l.id, expected_revision: l.revision });
           toast(`撤销成功，释放未消费 ${r.released_amount}`); refreshAll(); }
         catch (e) { toast(e.message, false); }
       };

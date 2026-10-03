@@ -444,10 +444,12 @@ def test_restart_rebuild(srv: Server):
     check("各节点余额逐字段重建一致",
           [(n["id"], n["available"], n["consumed"]) for n in after["nodes"]]
           == [(n["id"], n["available"], n["consumed"]) for n in before["nodes"]])
-    check("租约状态（含已关闭/消费/原因）重建一致",
-          [(l["id"], l["status"], l["amount"], l["consumed"], l["remaining"], l["reason"])
+    check("租约状态（含已关闭/消费/原因/修订号/截止时间）重建一致",
+          [(l["id"], l["status"], l["amount"], l["consumed"], l["remaining"], l["reason"],
+            l["revision"], l["expires_at"])
            for l in after["leases"]]
-          == [(l["id"], l["status"], l["amount"], l["consumed"], l["remaining"], l["reason"])
+          == [(l["id"], l["status"], l["amount"], l["consumed"], l["remaining"], l["reason"],
+               l["revision"], l["expires_at"])
               for l in before["leases"]])
     check("总消费重建一致", after["total_consumed"] == before["total_consumed"])
     ok, failed = audit_ok(c)
@@ -460,8 +462,275 @@ def test_restart_rebuild(srv: Server):
     check("重启后已处理过的 usage_event_id 仍被拒绝", code == 409, f"code={code}")
 
 
+def test_lease_amend(srv: Server):
+    print("\n[10] 租约有效期修订（乐观修订号 / 幂等 / 冲突 / 并发互斥 / 重启）")
+    c = srv.client
+    c.post("/api/nodes", {"type": "organization", "parent_id": "platform", "node_id": "org-a"})
+    c.post("/api/nodes", {"type": "project", "parent_id": "org-a", "node_id": "proj-a"})
+    c.post("/api/nodes", {"type": "client", "parent_id": "proj-a", "node_id": "cli-a"})
+    # 沿树注入额度：platform → org → proj（proj-a 方可向客户端授约）
+    c.post("/api/leases", {"lessor_id": "platform", "holder_id": "org-a",
+                           "amount": 100, "lease_id": "Lam-org"})
+    c.post("/api/leases", {"lessor_id": "org-a", "holder_id": "proj-a",
+                           "amount": 100, "lease_id": "Lam-proj"})
+
+    # 长 TTL 租约（续约测试主对象）与永久租约（修订应被拒绝）
+    code, _ = c.post("/api/leases", {"lessor_id": "proj-a", "holder_id": "cli-a",
+                                     "amount": 40, "lease_id": "Lam-ttl", "ttl_seconds": 3600})
+    check("带 TTL 租约授予（初始修订号 0）", code == 201, f"code={code}")
+    c.post("/api/leases", {"lessor_id": "proj-a", "holder_id": "cli-a",
+                           "amount": 10, "lease_id": "Lam-perm"})
+
+    def state_of(lid):
+        st = c.get("/api/state")[1]
+        return next(x for x in st["leases"] if x["id"] == lid)
+
+    before = state_of("Lam-ttl")
+    check("授予后修订号 = 0", before["revision"] == 0, str(before.get("revision")))
+
+    # 成功修订：expected_revision=0，延后 600 秒，修订号递增为 1
+    code, r = c.post("/api/leases/amend",
+                     {"lease_id": "Lam-ttl", "expected_revision": 0, "extend_seconds": 600,
+                      "command_id": "cmd-amend-1"})
+    check("修订成功（延后 600s）", code == 201 and r["revision"] == 1, f"code={code} {r}")
+    after = state_of("Lam-ttl")
+    check("截止时间被延长", after["expires_at"] >= before["expires_at"] + 590,
+          f"{before['expires_at']} -> {after['expires_at']}")
+    check("修订号递增为 1、修订历史计数 1",
+          after["revision"] == 1 and after["amendment_count"] == 1, str(after))
+
+    # 相同 command_id（连同相同请求体）重试 → 返回第一次的结果（幂等重放）
+    t0 = time.time()
+    code, r2 = c.post("/api/leases/amend",
+                      {"lease_id": "Lam-ttl", "expected_revision": 0, "extend_seconds": 600,
+                       "command_id": "cmd-amend-1"})
+    check("同一请求标识再次提交 → 200 重放首次结果",
+          code == 200 and r2.get("replayed") is True and r2["revision"] == 1
+          and r2["new_expires_at"] == r["new_expires_at"], f"code={code} {r2}")
+    check("幂等重放不改变时间/修订号（延长量不重新计算）",
+          time.time() >= t0 and state_of("Lam-ttl")["revision"] == 1)
+
+    # 修订号过旧（仍提交 0）→ 冲突，且回传最新状态
+    code, err = c.post("/api/leases/amend",
+                       {"lease_id": "Lam-ttl", "expected_revision": 0, "extend_seconds": 900,
+                        "command_id": "cmd-amend-stale"})
+    check("修订号过旧 → 409", code == 409, f"code={code}")
+    check("冲突回传当前修订号 1 与最新截止时间",
+          err.get("details", {}).get("current_revision") == 1
+          and err["details"].get("expires_at") == after["expires_at"], str(err.get("details")))
+
+    # 修订号过新（跳跃）→ 冲突
+    code, _ = c.post("/api/leases/amend",
+                     {"lease_id": "Lam-ttl", "expected_revision": 5, "extend_seconds": 900})
+    check("修订号过新（跳跃）→ 409", code == 409, f"code={code}")
+
+    # 目标时间没有向后延长 → 冲突（绝对时间，恰好当前截止时间）
+    code, err = c.post("/api/leases/amend",
+                       {"lease_id": "Lam-ttl", "expected_revision": 1,
+                        "new_expires_at": after["expires_at"]})
+    check("新截止时间未晚于当前 → 409", code == 409, f"code={code} {err}")
+
+    # 绝对时间成功续到更远：修订号 1 → 2
+    future = time.time() + 7200
+    code, r = c.post("/api/leases/amend",
+                     {"lease_id": "Lam-ttl", "expected_revision": 1,
+                      "new_expires_at": future})
+    check("绝对时间修订成功，修订号 → 2", code == 201 and r["revision"] == 2, f"code={code} {r}")
+    check("缩短有效期（更早截止）→ 409",
+          c.post("/api/leases/amend",
+                 {"lease_id": "Lam-ttl", "expected_revision": 2,
+                  "new_expires_at": state_of("Lam-ttl")["expires_at"] - 1})[0] == 409)
+    check("同时提供 extend 与绝对时间 → 400",
+          c.post("/api/leases/amend",
+                 {"lease_id": "Lam-ttl", "expected_revision": 2,
+                  "extend_seconds": 10, "new_expires_at": future + 10})[0] == 400)
+    check("两者都不提供 → 400",
+          c.post("/api/leases/amend",
+                 {"lease_id": "Lam-ttl", "expected_revision": 2})[0] == 400)
+
+    # 永久租约不能修订有效期
+    code, err = c.post("/api/leases/amend",
+                       {"lease_id": "Lam-perm", "expected_revision": 0, "extend_seconds": 100})
+    check("永久租约（无截止时间）修订 → 409", code == 409, f"code={code} {err}")
+
+    # 已关闭的租约不能修订
+    code, _ = c.post("/api/leases/revoke", {"lease_id": "Lam-perm"})
+    check("先撤销永久租约", code == 201, f"code={code}")
+    code, err = c.post("/api/leases/amend",
+                       {"lease_id": "Lam-perm", "expected_revision": 0, "extend_seconds": 100})
+    check("已关闭租约修订 → 409，details 指明状态",
+          code == 409 and err.get("details", {}).get("status") == "closed", f"{code} {err}")
+
+    # 客户端已下线：其活动租约修订被拒。用独立客户端 cli-b，避免关闭主测租约
+    c.post("/api/nodes", {"type": "client", "parent_id": "proj-a", "node_id": "cli-b"})
+    c.post("/api/leases", {"lessor_id": "proj-a", "holder_id": "cli-b",
+                           "amount": 5, "lease_id": "Lam-off", "ttl_seconds": 3600})
+    c.post("/api/clients/presence", {"client_id": "cli-b", "online": False})
+    code, err = c.post("/api/leases/amend",
+                       {"lease_id": "Lam-off", "expected_revision": 0, "extend_seconds": 100})
+    check("客户端已下线时修订其租约 → 409（离线即结算，租约已关闭）",
+          code == 409 and err.get("details", {}).get("status") == "closed", f"{code} {err}")
+
+    # 到期“挂起等待结算”只能发生在仍支撑下游的中间层租约：
+    # 独立组织/项目，项目租约 1s 到期但仍挂着活动的客户端租约 → pending
+    c.post("/api/nodes", {"type": "organization", "parent_id": "platform", "node_id": "org-m"})
+    c.post("/api/nodes", {"type": "project", "parent_id": "org-m", "node_id": "proj-m"})
+    c.post("/api/nodes", {"type": "client", "parent_id": "proj-m", "node_id": "cli-m"})
+    c.post("/api/leases", {"lessor_id": "platform", "holder_id": "org-m",
+                           "amount": 50, "lease_id": "Lam-morg"})
+    c.post("/api/leases", {"lessor_id": "org-m", "holder_id": "proj-m",
+                           "amount": 40, "lease_id": "Lam-mproj", "ttl_seconds": 1})
+    c.post("/api/leases", {"lessor_id": "proj-m", "holder_id": "cli-m",
+                           "amount": 20, "lease_id": "Lam-mcli", "ttl_seconds": 3600})
+    deadline = time.time() + 5
+    while time.time() < deadline:
+        if state_of("Lam-mproj")["status"] == "pending_expired":
+            break
+        time.sleep(0.1)
+    code, err = c.post("/api/leases/amend",
+                       {"lease_id": "Lam-mproj", "expected_revision": 0, "extend_seconds": 1000})
+    check("到期挂起（等待结算）的中间层租约修订 → 409",
+          code == 409 and err.get("details", {}).get("status") == "pending_expired",
+          f"{code} {err}")
+
+    # 不存在的租约 → 404
+    code, _ = c.post("/api/leases/amend",
+                     {"lease_id": "Lam-nope", "expected_revision": 0, "extend_seconds": 10})
+    check("不存在的租约修订 → 404", code == 404, f"code={code}")
+
+    # 并发：10 个请求都基于修订号 2 续约，恰好一个成功，其余修订号冲突
+    results = []
+    lock = threading.Lock()
+
+    def aworker(i):
+        code, body = srv.client.post("/api/leases/amend", {
+            "lease_id": "Lam-ttl", "expected_revision": 2,
+            "extend_seconds": 3600 + i, "command_id": f"cmd-amend-c{i}",
+        })
+        with lock:
+            results.append((code, body))
+
+    threads = [threading.Thread(target=aworker, args=(i,)) for i in range(10)]
+    for t in threads: t.start()
+    for t in threads: t.join()
+    check("并发同修订号续约：恰好 1 成功 / 9 冲突",
+          sum(1 for cd, _ in results if cd == 201) == 1
+          and sum(1 for cd, _ in results if cd == 409) == 9, str(sorted(cd for cd, _ in results)))
+    check("成功后修订号恰好为 3", state_of("Lam-ttl")["revision"] == 3,
+          str(state_of('Lam-ttl')))
+
+    # 并发互斥：续约与归还同时进行，只能有一个状态变更落账
+    c.post("/api/leases", {"lessor_id": "proj-a", "holder_id": "cli-a",
+                           "amount": 5, "lease_id": "Lam-race", "ttl_seconds": 3600})
+    race = []
+
+    def amend_race():
+        race.append(("amend",) + srv.client.post("/api/leases/amend", {
+            "lease_id": "Lam-race", "expected_revision": 0, "extend_seconds": 999,
+            "command_id": "cmd-race-amend"})[:1])
+
+    def release_race():
+        race.append(("release",) + srv.client.post("/api/leases/release",
+                                                   {"lease_id": "Lam-race",
+                                                    "expected_revision": 0,
+                                                    "command_id": "cmd-race-rel"})[:1])
+
+    t1 = threading.Thread(target=amend_race)
+    t2 = threading.Thread(target=release_race)
+    t1.start(); t2.start(); t1.join(); t2.join()
+    winners = [name for name, cd in race if cd in (200, 201)]
+    losers = [(name, cd) for name, cd in race if cd == 409]
+    check("续约与归还竞争：恰有一方成功、一方看到最新状态(409)",
+          len(winners) == 1 and len(losers) == 1, str(race))
+    evts = c.get("/api/events")[1]["events"]
+    amended = [e for e in evts if e["event_type"] == "LeaseAmended"
+               and e["payload"].get("lease_id") == "Lam-race"]
+    closed = [e for e in evts if e["event_type"] == "LeaseClosed"
+              and e["payload"].get("lease_id") == "Lam-race"]
+    check("事件账本中该租约只落入一个变更（不会既续约又关闭）",
+          (len(amended) == 1) ^ (len(closed) == 1), f"amend={len(amended)} closed={len(closed)}")
+    if amended:
+        check("（本次为续约胜出）归还方随后看到租约仍活动但修订号已变",
+              state_of("Lam-race")["status"] == "active"
+              and state_of("Lam-race")["revision"] == 1)
+    else:
+        check("（本次为归还胜出）续约方随后看到租约已关闭",
+              state_of("Lam-race")["status"] == "closed")
+
+    # 同样的互斥适用于“续约 vs 撤销”：跑多轮保证两种先后都覆盖到
+    saw_amend_win = saw_revoke_win = False
+    for round_i in range(20):
+        lid = f"Lam-rr{round_i}"
+        c.post("/api/leases", {"lessor_id": "proj-a", "holder_id": "cli-a",
+                               "amount": 1, "lease_id": lid, "ttl_seconds": 3600})
+        outcomes = []
+
+        def a2():
+            outcomes.append(("amend",) + srv.client.post("/api/leases/amend", {
+                "lease_id": lid, "expected_revision": 0, "extend_seconds": 777,
+                "command_id": f"cmd-rr-a-{round_i}"})[:1])
+
+        def r2():
+            outcomes.append(("revoke",) + srv.client.post("/api/leases/revoke", {
+                "lease_id": lid, "expected_revision": 0,
+                "command_id": f"cmd-rr-r-{round_i}"})[:1])
+
+        x = threading.Thread(target=a2); y = threading.Thread(target=r2)
+        x.start(); y.start(); x.join(); y.join()
+        codes = {name: cd for name, cd in outcomes}
+        check(f"第{round_i}轮 续约/撤销恰一成一败",
+              sorted(codes.values()) == [201, 409], str(outcomes))
+        if codes.get("amend") == 201:
+            saw_amend_win = True
+            check(f"第{round_i}轮 续约胜出则租约仍 active/rev=1",
+                  state_of(lid)["status"] == "active" and state_of(lid)["revision"] == 1)
+            c.post("/api/leases/release", {"lease_id": lid})  # 清理
+        else:
+            saw_revoke_win = True
+            check(f"第{round_i}轮 撤销胜出则租约 closed",
+                  state_of(lid)["status"] == "closed")
+    check("20 轮中两种胜出顺序都出现过（互斥不偏向任一方）",
+          saw_amend_win and saw_revoke_win, f"amend_win={saw_amend_win} revoke_win={saw_revoke_win}")
+
+    # 余额/守恒不受续约影响，审计仍通过
+    st = c.get("/api/state")[1]
+    check("续约不改变全局守恒",
+          st["total_available"] + st["total_consumed"] == st["global_capacity"])
+    ok, failed = audit_ok(c)
+    check("续约场景全程审计通过（含 replay_equivalence）", ok, str(failed))
+
+    # 重启后恢复修订号、截止时间与修订历史
+    rev3_expires = state_of("Lam-ttl")["expires_at"]
+    srv.restart()
+    recovered = state_of("Lam-ttl")
+    check("重启后修订号恢复为 3", recovered["revision"] == 3, str(recovered.get("revision")))
+    check("重启后截止时间恢复", abs(recovered["expires_at"] - rev3_expires) < 1e-6,
+          str(recovered.get("expires_at")))
+    check("重启后修订历史恢复（3 次）", recovered["amendment_count"] == 3,
+          str(recovered.get("amendment_count")))
+    # 重启后旧的幂等命令标识仍返回第一次结果
+    code, rr = c.post("/api/leases/amend",
+                      {"lease_id": "Lam-ttl", "expected_revision": 0, "extend_seconds": 600,
+                       "command_id": "cmd-amend-1"})
+    check("重启后同一命令标识仍重放首次结果",
+          code == 200 and rr.get("replayed") is True and rr["revision"] == 1, f"code={code} {rr}")
+    ok, failed = audit_ok(c)
+    check("重启后续约相关审计通过", ok, str(failed))
+
+    # 修订与归还/撤销共享版本号：续约后用旧修订号归还/撤销 → 冲突
+    code, err = c.post("/api/leases/release",
+                       {"lease_id": "Lam-ttl", "expected_revision": 0})
+    check("续约后用旧修订号归还 → 409（修订与归还互斥）", code == 409, f"{code} {err}")
+    code, err = c.post("/api/leases/revoke",
+                       {"lease_id": "Lam-ttl", "expected_revision": 2})
+    check("用过旧修订号撤销 → 409", code == 409 and err["details"]["current_revision"] == 3,
+          f"{code} {err}")
+    code, _ = c.post("/api/leases/release", {"lease_id": "Lam-ttl"})
+    check("不带修订号的归还仍成功（向后兼容）", code == 201, f"code={code}")
+
+
 def test_tamper_detection(srv: Server):
-    print("\n[9] 账本篡改检测（哈希链 + 重放不等价）")
+    print("\n[11] 账本篡改检测（哈希链 + 重放不等价）")
     c = srv.client
     ok, _ = audit_ok(c)
     check("正常状态审计通过", ok)
@@ -492,6 +761,7 @@ def main():
         test_concurrent_grants(srv)
         test_concurrent_replay_safe(srv)
         test_restart_rebuild(srv)
+        test_lease_amend(srv)
         test_tamper_detection(srv)
 
         print("\n[终态审计]")

@@ -10,6 +10,7 @@
   POST /api/capacity           调整全局容量（缩容防超卖）
   POST /api/leases             申请租约（父级可用额度内、可带 ttl_seconds）
   POST /api/leases/usage       按幂等事件扣减（usage_event_id 去重）
+  POST /api/leases/amend       修订有效期（expected_revision + extend_seconds/new_expires_at）
   POST /api/leases/release     归还租约（释放未消费部分）
   POST /api/leases/revoke      父级撤销/缩容（有下级占用时拒绝）
   POST /api/clients/presence   客户端上/下线（离线关闭其全部租约）
@@ -33,6 +34,7 @@ KIND_BY_PATH = {
     "/api/capacity": "capacity",
     "/api/leases": "grant",
     "/api/leases/usage": "usage",
+    "/api/leases/amend": "amend",
     "/api/leases/release": "release",
     "/api/leases/revoke": "revoke",
     "/api/clients/presence": "presence",
@@ -79,6 +81,13 @@ class Handler(BaseHTTPRequestHandler):
     def _service(self) -> QuotaService:
         return self.server.service  # type: ignore[attr-defined]
 
+    def _error(self, exc: DomainError) -> None:
+        obj: dict = {"error": type(exc).__name__, "message": str(exc)}
+        details = getattr(exc, "details", None)
+        if details:
+            obj["details"] = details
+        self._json(exc.status, obj)
+
     # ------------------------------------------------------------------
     # 路由
     # ------------------------------------------------------------------
@@ -100,7 +109,7 @@ class Handler(BaseHTTPRequestHandler):
                 )
             self._json(404, {"error": "not_found", "message": f"未知路径: {path}"})
         except DomainError as exc:
-            self._json(exc.status, {"error": type(exc).__name__, "message": str(exc)})
+            self._error(exc)
         except Exception as exc:  # 防御：任何异常都返回结构化错误
             self.server.app_log(f"ERROR {path}: {exc!r}")
             self._json(500, {"error": "InternalError", "message": str(exc)})
@@ -117,7 +126,7 @@ class Handler(BaseHTTPRequestHandler):
             code = 200 if result.get("replayed") else 201
             self._json(code, result)
         except DomainError as exc:
-            self._json(exc.status, {"error": type(exc).__name__, "message": str(exc)})
+            self._error(exc)
         except Exception as exc:
             self.server.app_log(f"ERROR POST {path}: {exc!r}")
             self._json(500, {"error": "InternalError", "message": str(exc)})

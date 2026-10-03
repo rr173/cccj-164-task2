@@ -25,6 +25,7 @@
 
 from __future__ import annotations
 
+import math
 import time
 import uuid
 from typing import Any
@@ -36,6 +37,12 @@ from typing import Any
 
 class DomainError(Exception):
     status = 400
+
+    def __init__(self, message: str, details: dict[str, Any] | None = None) -> None:
+        super().__init__(message)
+        # 冲突时回传最新状态（当前修订号/截止时间/租约状态），
+        # 让失败方无需另查即可据此重试
+        self.details = details
 
 
 class ValidationError(DomainError):
@@ -134,6 +141,7 @@ class Projection:
         view = {
             **lease,
             "remaining": self.edge_remaining(lease),
+            "amendment_count": len(lease["amendments"]),
             "lessor_type": self.nodes.get(lease["lessor_id"], {}).get("type"),
             "holder_type": self.nodes.get(lease["holder_id"], {}).get("type"),
         }
@@ -202,6 +210,8 @@ class Projection:
                     l["consumed"],
                     l["own_consumed"],
                     l["reason"],
+                    l["revision"],
+                    l["expires_at"],
                 )
                 for lid, l in self.leases.items()
             ),
@@ -263,6 +273,10 @@ def apply_event(p: Projection, evt: dict[str, Any]) -> None:
             "expires_at": evt["expires_at"],
             "closed_at": None,
             "reason": None,
+            # 乐观修订号：授予即为 0，每次有效期成功修订 +1
+            "revision": 0,
+            # 有效期修订历史（权威历史在事件账本；这里是折叠出的读模型）
+            "amendments": [],
         }
         p.balance[evt["lessor_id"]] -= evt["amount"]
         p.balance[evt["holder_id"]] += evt["amount"]
@@ -306,12 +320,28 @@ def apply_event(p: Projection, evt: dict[str, Any]) -> None:
         lease["status"] = "pending_expired"
         lease["expired_marked_at"] = evt["marked_at"]
 
+    elif t == "LeaseAmended":
+        # 有效期修订：只更新截止时间与修订号，不动余额/消费量
+        lease = p.leases[evt["lease_id"]]
+        lease["revision"] = evt["revision"]
+        lease["expires_at"] = evt["new_expires_at"]
+        lease["amendments"].append(
+            {
+                "revision": evt["revision"],
+                "old_expires_at": evt["old_expires_at"],
+                "new_expires_at": evt["new_expires_at"],
+                "amended_at": evt["amended_at"],
+            }
+        )
+
     elif t == "LeaseClosed":
         lease = p.leases[evt["lease_id"]]
         remaining = lease["amount"] - lease["consumed"]
         lease["status"] = "closed"
         lease["reason"] = evt["reason"]
         lease["closed_at"] = evt["closed_at"]
+        # 关闭同样推进版本号（与续约互斥的依据）
+        lease["revision"] = evt["revision"]
         # 只退尚未消费部分；已消费部分不复活
         p.balance[lease["holder_id"]] -= remaining
         p.balance[lease["lessor_id"]] += remaining
@@ -341,16 +371,33 @@ def _require_int(value: Any, field: str, minimum: int | None = None) -> int:
     return value
 
 
-def _get_active_lease(p: Projection, lease_id: Any) -> dict[str, Any]:
+def _lease_state(lease: dict[str, Any]) -> dict[str, Any]:
+    """租约最新状态摘要（随冲突返回，供失败方据此重试）。"""
+    return {
+        "lease_id": lease["id"],
+        "status": lease["status"],
+        "current_revision": lease["revision"],
+        "expires_at": lease["expires_at"],
+        "reason": lease["reason"],
+    }
+
+
+def _get_active_lease(p: Projection, lease_id: Any, action: str = "操作") -> dict[str, Any]:
     if not lease_id or not isinstance(lease_id, str):
         raise ValidationError("lease_id 必填")
     lease = p.leases.get(lease_id)
     if lease is None:
         raise NotFoundError(f"租约不存在: {lease_id}")
     if lease["status"] == "pending_expired":
-        raise ConflictError(f"租约 {lease_id} 已到期，等待余量结算")
+        raise ConflictError(
+            f"租约 {lease_id} 已到期，等待余量结算，不能{action}",
+            details=_lease_state(lease),
+        )
     if lease["status"] != "active":
-        raise ConflictError(f"租约 {lease_id} 已关闭（{lease['reason']}）")
+        raise ConflictError(
+            f"租约 {lease_id} 已关闭（{lease['reason']}），不能{action}",
+            details=_lease_state(lease),
+        )
     return lease
 
 
@@ -360,6 +407,8 @@ def _close_event(lease: dict[str, Any], reason: str) -> dict[str, Any]:
         "payload": {
             "lease_id": lease["id"],
             "reason": reason,
+            # 关闭也是一次状态变更：修订号 +1，与续约共享同一版本
+            "revision": lease["revision"] + 1,
             "released_amount": lease["amount"] - lease["consumed"],
             "consumed_amount": lease["consumed"],
             "closed_at": time.time(),
@@ -493,10 +542,13 @@ def handle_usage(p: Projection, body: dict[str, Any]) -> list[dict[str, Any]]:
     if usage_event_id in p.usage_event_ids:
         raise ConflictError(f"用量回执已处理: {usage_event_id}")
 
-    lease = _get_active_lease(p, lease_id)
+    lease = _get_active_lease(p, lease_id, "记录用量")
     holder = p.nodes[lease["holder_id"]]
     if holder["type"] == "client" and not holder["online"]:
-        raise ConflictError("客户端离线，不能记录用量")
+        raise ConflictError(
+            "客户端离线，不能记录用量", details=_lease_state(lease)
+        )
+    _check_expected_revision(p, lease, body)
     remaining = lease["amount"] - lease["consumed"]
     if amount > remaining:
         raise ConflictError(f"超卖拒绝：本次用量 {amount} 超过租约剩余 {remaining}")
@@ -513,6 +565,24 @@ def handle_usage(p: Projection, body: dict[str, Any]) -> list[dict[str, Any]]:
             },
         }
     ]
+
+
+def _check_expected_revision(p: Projection, lease: dict[str, Any], body: dict[str, Any]) -> None:
+    """归还/撤销等写命令可携带 expected_revision 做乐观并发。
+
+    与修订命令共享同一个租约版本号：任何成功的状态变更（修订或关闭）
+    都会让修订号 +1，因此同一版本上竞争的两个写操作只有一个能落账，
+    另一方在此被拒（409）并看到最新状态。不传则不做版本检查（向后兼容）。
+    """
+    if body.get("expected_revision") is None:
+        return
+    expected = _require_int(body.get("expected_revision"), "expected_revision", 0)
+    if expected != lease["revision"]:
+        raise ConflictError(
+            f"修订号冲突：提交 {expected}，当前为 {lease['revision']}"
+            "（租约刚被其他操作变更，请读取最新状态后重试）",
+            details=_lease_state(lease),
+        )
 
 
 def _guard_close(p: Projection, lease: dict[str, Any], action: str) -> None:
@@ -532,16 +602,98 @@ def _guard_close(p: Projection, lease: dict[str, Any], action: str) -> None:
 
 def handle_release(p: Projection, body: dict[str, Any]) -> list[dict[str, Any]]:
     _require_bootstrap(p)
-    lease = _get_active_lease(p, body.get("lease_id"))
+    lease = _get_active_lease(p, body.get("lease_id"), "归还")
+    _check_expected_revision(p, lease, body)
     _guard_close(p, lease, "归还")
     return [_close_event(lease, "released")]
 
 
 def handle_revoke(p: Projection, body: dict[str, Any]) -> list[dict[str, Any]]:
     _require_bootstrap(p)
-    lease = _get_active_lease(p, body.get("lease_id"))
+    lease = _get_active_lease(p, body.get("lease_id"), "撤销")
+    _check_expected_revision(p, lease, body)
     _guard_close(p, lease, "撤销/缩容")
     return [_close_event(lease, "revoked")]
+
+
+def handle_amend(p: Projection, body: dict[str, Any]) -> list[dict[str, Any]]:
+    """修订（延长）仍在生效租约的有效期。
+
+    乐观并发：持有人提交它所看到的 ``expected_revision`` 与一个更晚的
+    截止时间。成功后修订号 +1；编号过旧/过新、租约已关闭或等待结算、
+    客户端已下线、目标时间没有向后延长都返回冲突（409），并回传租约
+    最新状态。相同 command_id 的重试由命令回执表重放第一次的结果。
+
+    目标截止时间二选一：相对 ``extend_seconds``（在*当前截止时间*
+    之上顺延的增量）或绝对 Unix 时间 ``new_expires_at``。两者都必须让
+    截止时间严格变晚。修订只改时间，不动任何余额。
+    """
+    _require_bootstrap(p)
+    lease = _get_active_lease(p, body.get("lease_id"), "修订有效期")
+
+    holder = p.nodes[lease["holder_id"]]
+    if holder["type"] == "client" and not holder["online"]:
+        raise ConflictError(
+            f"客户端 {lease['holder_id']} 已下线，不能修订租约有效期",
+            details=_lease_state(lease),
+        )
+
+    expected_revision = _require_int(
+        body.get("expected_revision", 0), "expected_revision", 0
+    )
+    if expected_revision != lease["revision"]:
+        raise ConflictError(
+            f"修订号冲突：提交 {expected_revision}，当前为 {lease['revision']}"
+            "（已有更新的修订或租约状态已变化），请读取最新状态后重试",
+            details=_lease_state(lease),
+        )
+
+    if lease["expires_at"] is None:
+        raise ConflictError(
+            f"租约 {lease['id']} 是永久租约（无截止时间），无需修订有效期",
+            details=_lease_state(lease),
+        )
+
+    has_ext = body.get("extend_seconds") is not None
+    has_deadline = body.get("new_expires_at") is not None
+    if has_ext == has_deadline:
+        raise ValidationError(
+            "必须且只能提供 extend_seconds 或 new_expires_at 之一"
+        )
+    if has_ext:
+        # 延长量：在当前截止时间（而非“现在”）之上顺延，
+        # 语义为明确的“向后延长”，与剩余多少无关
+        extend = _require_int(body.get("extend_seconds"), "extend_seconds", 1)
+        new_expires_at = lease["expires_at"] + extend
+    else:
+        raw = body.get("new_expires_at")
+        if isinstance(raw, bool) or not isinstance(raw, (int, float)):
+            raise ValidationError("new_expires_at 必须是 Unix 时间戳（数字）")
+        if not math.isfinite(raw) or raw <= 0:
+            raise ValidationError("new_expires_at 必须是正数时间戳")
+        new_expires_at = float(raw)
+
+    if new_expires_at <= lease["expires_at"]:
+        raise ConflictError(
+            "有效期修订被拒绝：新截止时间必须晚于当前截止时间（不能缩短/不变）",
+            details={
+                **_lease_state(lease),
+                "requested_expires_at": new_expires_at,
+            },
+        )
+
+    return [
+        {
+            "type": "LeaseAmended",
+            "payload": {
+                "lease_id": lease["id"],
+                "revision": lease["revision"] + 1,
+                "old_expires_at": lease["expires_at"],
+                "new_expires_at": new_expires_at,
+                "amended_at": time.time(),
+            },
+        }
+    ]
 
 
 def handle_presence(p: Projection, body: dict[str, Any]) -> list[dict[str, Any]]:
@@ -644,6 +796,7 @@ HANDLERS = {
     "capacity": handle_capacity,
     "grant": handle_grant,
     "usage": handle_usage,
+    "amend": handle_amend,
     "release": handle_release,
     "revoke": handle_revoke,
     "presence": handle_presence,
@@ -667,9 +820,17 @@ RESULT_EXTRACTORS = {
         "usage_event_id": pl["usage_event_id"],
     },
     "LeaseExpired": lambda pl: {"lease_id": pl["lease_id"], "marked_at": pl["marked_at"]},
+    "LeaseAmended": lambda pl: {
+        "lease_id": pl["lease_id"],
+        "revision": pl["revision"],
+        "old_expires_at": pl["old_expires_at"],
+        "new_expires_at": pl["new_expires_at"],
+        "amended_at": pl["amended_at"],
+    },
     "LeaseClosed": lambda pl: {
         "lease_id": pl["lease_id"],
         "reason": pl["reason"],
+        "revision": pl["revision"],
         "released_amount": pl["released_amount"],
         "consumed_amount": pl["consumed_amount"],
     },
