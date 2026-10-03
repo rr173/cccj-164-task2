@@ -340,8 +340,196 @@ def test_expiry_and_offline(srv: Server):
     check("重新上线后可再租约", code == 201, f"code={code}")
 
 
+def test_lease_amend(srv: Server):
+    print("\n[6] 租约有效期修订（乐观修订号 / 幂等 / 竞态 / 重启恢复）")
+    c = srv.client
+    c.post("/api/nodes", {"type": "organization", "parent_id": "platform", "node_id": "org-a"})
+    c.post("/api/nodes", {"type": "project", "parent_id": "org-a", "node_id": "proj-a"})
+    c.post("/api/nodes", {"type": "client", "parent_id": "proj-a", "node_id": "cli-a"})
+    _, g_org = c.post("/api/leases", {"lessor_id": "platform", "holder_id": "org-a",
+                                      "amount": 300, "lease_id": "La-org", "ttl_seconds": 3600})
+    c.post("/api/leases", {"lessor_id": "org-a", "holder_id": "proj-a",
+                           "amount": 200, "lease_id": "La-proj", "ttl_seconds": 3600})
+    _, g_cli = c.post("/api/leases", {"lessor_id": "proj-a", "holder_id": "cli-a",
+                                      "amount": 100, "lease_id": "La-cli", "ttl_seconds": 3600})
+    exp_org0 = g_org["expires_at"]
+    exp0 = g_cli["expires_at"]
+
+    def lease(lid):
+        st = c.get("/api/state")[1]
+        return next(x for x in st["leases"] if x["id"] == lid)
+
+    def events_for(lid, etype):
+        ev = c.get("/api/events")[1]["events"]
+        return [e for e in ev if e["event_type"] == etype and e["payload"].get("lease_id") == lid]
+
+    # 参数校验
+    code, _ = c.post("/api/leases/amend", {"lease_id": "La-cli", "new_expires_at": exp0 + 100})
+    check("缺 expected_revision → 400", code == 400, f"code={code}")
+    code, _ = c.post("/api/leases/amend", {"lease_id": "La-cli", "expected_revision": 0})
+    check("缺 new_expires_at → 400", code == 400, f"code={code}")
+    code, _ = c.post("/api/leases/amend", {"lease_id": "L-nope", "expected_revision": 0,
+                                           "new_expires_at": exp0 + 100})
+    check("租约不存在 → 404", code == 404, f"code={code}")
+
+    # 成功修订：修订号 0 → 1，截止时间延长
+    code, r = c.post("/api/leases/amend", {"lease_id": "La-cli", "expected_revision": 0,
+                                           "new_expires_at": exp0 + 1800, "command_id": "amend-c1"})
+    check("有效期修订成功，修订号 0→1", code == 201 and r["revision"] == 1, f"code={code} {r}")
+    check("新截止时间生效", abs(r["new_expires_at"] - (exp0 + 1800)) < 1e-6, str(r))
+
+    # 同一请求标识重放 → 返回第一次的结果，不重复递增
+    code, r2 = c.post("/api/leases/amend", {"lease_id": "La-cli", "expected_revision": 0,
+                                            "new_expires_at": exp0 + 1800, "command_id": "amend-c1"})
+    check("同一 command_id 重放 → 200 且结果与首次一致",
+          code == 200 and r2.get("replayed") is True and r2["revision"] == 1, f"code={code}")
+    check("重放后修订号仍为 1", lease("La-cli")["revision"] == 1)
+
+    # 修订号过旧 → 409，提示携带当前修订号
+    code, err = c.post("/api/leases/amend", {"lease_id": "La-cli", "expected_revision": 0,
+                                             "new_expires_at": exp0 + 4000})
+    check("修订号过旧 → 409", code == 409, f"code={code}")
+    check("冲突提示包含当前修订号", "当前 1" in err.get("message", ""), err.get("message", ""))
+
+    # 目标时间未向后延长 → 409（早于当前 / 等于当前）
+    code, _ = c.post("/api/leases/amend", {"lease_id": "La-cli", "expected_revision": 1,
+                                           "new_expires_at": exp0 + 900})
+    check("新截止早于当前 → 409", code == 409, f"code={code}")
+    code, _ = c.post("/api/leases/amend", {"lease_id": "La-cli", "expected_revision": 1,
+                                           "new_expires_at": exp0 + 1800})
+    check("新截止等于当前 → 409", code == 409, f"code={code}")
+
+    # 用正确修订号继续修订：1 → 2；此后定时清算按新截止执行
+    code, r = c.post("/api/leases/amend", {"lease_id": "La-cli", "expected_revision": 1,
+                                           "new_expires_at": exp0 + 7200, "command_id": "amend-c3"})
+    check("第二次修订成功，修订号=2", code == 201 and r["revision"] == 2, f"code={code} {r}")
+    check("修订落入账本后不再按旧截止到期（无 LeaseExpired）",
+          len(events_for("La-cli", "LeaseExpired")) == 0)
+
+    # 并发：8 个相同预期修订号的修订竞争 → 恰好一个落入账本
+    res = []
+    lock = threading.Lock()
+
+    def aworker(i):
+        code, body = srv.client.post("/api/leases/amend", {
+            "lease_id": "La-cli", "expected_revision": 2,
+            "new_expires_at": exp0 + 8000 + i, "command_id": f"amend-race-{i}"})
+        with lock:
+            res.append((code, body))
+
+    threads = [threading.Thread(target=aworker, args=(i,)) for i in range(8)]
+    for t in threads: t.start()
+    for t in threads: t.join()
+    check("8 个并发修订恰好 1 个成功、7 个 409",
+          sum(1 for cd, _ in res if cd == 201) == 1 and sum(1 for cd, _ in res if cd == 409) == 7,
+          str([cd for cd, _ in res]))
+    check("修订号只递增一次（=3）", lease("La-cli")["revision"] == 3,
+          str(lease("La-cli")["revision"]))
+    check("账本中该租约的修订事件数 = 3", len(events_for("La-cli", "LeaseExpiryAmended")) == 3)
+
+    # 修订与归还并发：只有一个先落入账本，失败方看到最新状态
+    res2 = {"amend": [], "release": []}
+
+    def aworker2(i):
+        code, body = srv.client.post("/api/leases/amend", {
+            "lease_id": "La-cli", "expected_revision": 3,
+            "new_expires_at": exp0 + 20000 + i, "command_id": f"amend-rel-{i}"})
+        with lock:
+            res2["amend"].append((code, body))
+
+    def rworker():
+        code, body = srv.client.post("/api/leases/release",
+                                     {"lease_id": "La-cli", "command_id": "release-race-1"})
+        with lock:
+            res2["release"].append((code, body))
+
+    threads = [threading.Thread(target=aworker2, args=(i,)) for i in range(4)]
+    threads.append(threading.Thread(target=rworker))
+    for t in threads: t.start()
+    for t in threads: t.join()
+    check("与修订并发的归还成功（201）", res2["release"][0][0] == 201, str(res2["release"]))
+    check("竞争中的修订要么成功要么 409",
+          all(cd in (201, 409) for cd, _ in res2["amend"]), str([cd for cd, _ in res2["amend"]]))
+    amend_409 = [b for cd, b in res2["amend"] if cd == 409]
+    check("失败的修订能看到最新状态（错误信息说明原因）",
+          len(amend_409) >= 1 and all(b.get("message") for b in amend_409),
+          str(amend_409[:1]))
+    l = lease("La-cli")
+    check("竞争结束后租约已关闭（released）",
+          l["status"] == "closed" and l["reason"] == "released", str(l))
+    evs = [e for e in c.get("/api/events")[1]["events"]
+           if e["payload"].get("lease_id") == "La-cli"
+           and e["event_type"] in ("LeaseExpiryAmended", "LeaseClosed")]
+    check("账本顺序合法：该租约的修订事件都在关闭之前",
+          all(e["event_type"] == "LeaseExpiryAmended" for e in evs[:-1])
+          and evs[-1]["event_type"] == "LeaseClosed",
+          str([(e["seq"], e["event_type"]) for e in evs]))
+
+    # 已关闭租约 → 409
+    code, _ = c.post("/api/leases/amend", {"lease_id": "La-cli", "expected_revision": 3,
+                                           "new_expires_at": exp0 + 30000})
+    check("已关闭租约修订 → 409", code == 409, f"code={code}")
+
+    # 到期清算与修订竞争：清算先落入账本 → 修订 409 且账本只有 LeaseExpired
+    c.post("/api/nodes", {"type": "organization", "parent_id": "platform", "node_id": "org-x"})
+    c.post("/api/nodes", {"type": "project", "parent_id": "org-x", "node_id": "proj-x"})
+    c.post("/api/nodes", {"type": "client", "parent_id": "proj-x", "node_id": "cli-x"})
+    c.post("/api/leases", {"lessor_id": "platform", "holder_id": "org-x",
+                           "amount": 100, "lease_id": "Lx-org", "ttl_seconds": 3600})
+    c.post("/api/leases", {"lessor_id": "org-x", "holder_id": "proj-x",
+                           "amount": 80, "lease_id": "Lx-proj", "ttl_seconds": 2})
+    c.post("/api/leases", {"lessor_id": "proj-x", "holder_id": "cli-x",
+                           "amount": 60, "lease_id": "Lx-cli", "ttl_seconds": 3600})
+    time.sleep(2.4)  # Lx-proj 到期被 sweep 挂起（下游仍占用 60，无法结算）
+    code, err = c.post("/api/leases/amend", {"lease_id": "Lx-proj", "expected_revision": 0,
+                                             "new_expires_at": time.time() + 7200})
+    check("定时清算先落入账本 → 修订 409（等待结算）",
+          code == 409 and "结算" in err.get("message", ""), f"code={code} {err}")
+    check("该租约账本只有 LeaseExpired，无修订事件",
+          len(events_for("Lx-proj", "LeaseExpired")) == 1
+          and len(events_for("Lx-proj", "LeaseExpiryAmended")) == 0)
+    check("失败方可看到最新状态（pending_expired）",
+          lease("Lx-proj")["status"] == "pending_expired")
+
+    # 客户端已下线 → 409
+    c.post("/api/leases", {"lessor_id": "proj-a", "holder_id": "cli-a",
+                           "amount": 10, "lease_id": "La-cli2", "ttl_seconds": 3600})
+    c.post("/api/clients/presence", {"client_id": "cli-a", "online": False})
+    code, err = c.post("/api/leases/amend", {"lease_id": "La-cli2", "expected_revision": 0,
+                                             "new_expires_at": time.time() + 7200})
+    check("客户端已下线 → 409", code == 409 and "下线" in err.get("message", ""),
+          f"code={code} {err}")
+    c.post("/api/clients/presence", {"client_id": "cli-a", "online": True})
+
+    # 永久租约（无截止时间）→ 409
+    c.post("/api/leases", {"lessor_id": "proj-a", "holder_id": "cli-a",
+                           "amount": 5, "lease_id": "La-perm"})
+    code, _ = c.post("/api/leases/amend", {"lease_id": "La-perm", "expected_revision": 0,
+                                           "new_expires_at": time.time() + 100})
+    check("永久租约无法延长 → 409", code == 409, f"code={code}")
+
+    # 重启恢复：修订号、截止时间、变更历史均可从账本重建
+    code, r = c.post("/api/leases/amend", {"lease_id": "La-org", "expected_revision": 0,
+                                           "new_expires_at": exp_org0 + 1800,
+                                           "command_id": "amend-org-1"})
+    check("组织租约修订成功（为重启恢复做准备）", code == 201 and r["revision"] == 1, f"code={code}")
+    srv.restart()
+    l = lease("La-org")
+    check("重启后修订号恢复", l["revision"] == 1, str(l["revision"]))
+    check("重启后截止时间恢复", abs(l["expires_at"] - (exp_org0 + 1800)) < 1e-6,
+          str(l["expires_at"]))
+    check("重启后变更历史仍在账本", len(events_for("La-org", "LeaseExpiryAmended")) == 1)
+    code, r = c.post("/api/leases/amend", {"lease_id": "La-org", "expected_revision": 0,
+                                           "new_expires_at": exp_org0 + 1800,
+                                           "command_id": "amend-org-1"})
+    check("重启后同一请求标识仍重放首次结果",
+          code == 200 and r.get("replayed") is True and r["revision"] == 1, f"code={code}")
+    ok, failed = audit_ok(c)
+    check("重启后审计通过", ok, str(failed))
+
+
 def test_concurrent_grants(srv: Server):
-    print("\n[6] 跨层并发申请：高并发下绝不超卖")
+    print("\n[7] 跨层并发申请：高并发下绝不超卖")
     c = srv.client
     c.post("/api/nodes", {"type": "organization", "parent_id": "platform", "node_id": "org-c"})
     c.post("/api/nodes", {"type": "project", "parent_id": "org-c", "node_id": "proj-c"})
@@ -404,7 +592,7 @@ def test_concurrent_grants(srv: Server):
 
 
 def test_concurrent_replay_safe(srv: Server):
-    print("\n[7] 同一命令的并发重复提交只生效一次")
+    print("\n[8] 同一命令的并发重复提交只生效一次")
     c = srv.client
     c.post("/api/nodes", {"type": "organization", "parent_id": "platform", "node_id": "org-rp"})
     codes = []
@@ -428,7 +616,7 @@ def test_concurrent_replay_safe(srv: Server):
 
 
 def test_restart_rebuild(srv: Server):
-    print("\n[8] 服务重启：从事件账本重建当前余额")
+    print("\n[9] 服务重启：从事件账本重建当前余额")
     c = srv.client
     before = c.get("/api/state")[1]
     events_before = c.get("/api/events")[1]["events"]
@@ -444,10 +632,12 @@ def test_restart_rebuild(srv: Server):
     check("各节点余额逐字段重建一致",
           [(n["id"], n["available"], n["consumed"]) for n in after["nodes"]]
           == [(n["id"], n["available"], n["consumed"]) for n in before["nodes"]])
-    check("租约状态（含已关闭/消费/原因）重建一致",
-          [(l["id"], l["status"], l["amount"], l["consumed"], l["remaining"], l["reason"])
+    check("租约状态（含已关闭/消费/原因/修订号/截止时间）重建一致",
+          [(l["id"], l["status"], l["amount"], l["consumed"], l["remaining"], l["reason"],
+            l["revision"], l["expires_at"])
            for l in after["leases"]]
-          == [(l["id"], l["status"], l["amount"], l["consumed"], l["remaining"], l["reason"])
+          == [(l["id"], l["status"], l["amount"], l["consumed"], l["remaining"], l["reason"],
+               l["revision"], l["expires_at"])
               for l in before["leases"]])
     check("总消费重建一致", after["total_consumed"] == before["total_consumed"])
     ok, failed = audit_ok(c)
@@ -461,7 +651,7 @@ def test_restart_rebuild(srv: Server):
 
 
 def test_tamper_detection(srv: Server):
-    print("\n[9] 账本篡改检测（哈希链 + 重放不等价）")
+    print("\n[10] 账本篡改检测（哈希链 + 重放不等价）")
     c = srv.client
     ok, _ = audit_ok(c)
     check("正常状态审计通过", ok)
@@ -489,6 +679,7 @@ def main():
         test_command_replay(srv)
         test_capacity_shrink(srv)
         test_expiry_and_offline(srv)
+        test_lease_amend(srv)
         test_concurrent_grants(srv)
         test_concurrent_replay_safe(srv)
         test_restart_rebuild(srv)

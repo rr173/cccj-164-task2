@@ -12,6 +12,7 @@
   POST /api/leases/usage       按幂等事件扣减（usage_event_id 去重）
   POST /api/leases/release     归还租约（释放未消费部分）
   POST /api/leases/revoke      父级撤销/缩容（有下级占用时拒绝）
+  POST /api/leases/amend       修订有效期（预期修订号 + 更晚截止时间）
   POST /api/clients/presence   客户端上/下线（离线关闭其全部租约）
 """
 
@@ -35,6 +36,7 @@ KIND_BY_PATH = {
     "/api/leases/usage": "usage",
     "/api/leases/release": "release",
     "/api/leases/revoke": "revoke",
+    "/api/leases/amend": "amend",
     "/api/clients/presence": "presence",
 }
 

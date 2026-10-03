@@ -13,6 +13,7 @@
                          （祖先租约的 consumed 增加、可退余量收缩）
   * LeaseClosed：        holder -(A-consumed)，lessor +(A-consumed)
                          —— 关闭只退“尚未消费”部分，消费永久保留
+  * LeaseExpiryAmended： 只改截止时间与修订号（乐观并发控制），不动余额
 
 由上面的记账规则可推出：
 
@@ -25,6 +26,7 @@
 
 from __future__ import annotations
 
+import math
 import time
 import uuid
 from typing import Any
@@ -202,6 +204,8 @@ class Projection:
                     l["consumed"],
                     l["own_consumed"],
                     l["reason"],
+                    l["revision"],
+                    l["expires_at"],
                 )
                 for lid, l in self.leases.items()
             ),
@@ -261,6 +265,7 @@ def apply_event(p: Projection, evt: dict[str, Any]) -> None:
             "status": "active",
             "granted_at": evt["granted_at"],
             "expires_at": evt["expires_at"],
+            "revision": 0,          # 有效期修订号，每次 LeaseExpiryAmended +1
             "closed_at": None,
             "reason": None,
         }
@@ -306,6 +311,13 @@ def apply_event(p: Projection, evt: dict[str, Any]) -> None:
         lease["status"] = "pending_expired"
         lease["expired_marked_at"] = evt["marked_at"]
 
+    elif t == "LeaseExpiryAmended":
+        # 有效期修订：只改截止时间与修订号，不动余额。
+        # 与到期 sweep 在同一把锁内串行，二者只有一个能落入账本。
+        lease = p.leases[evt["lease_id"]]
+        lease["expires_at"] = evt["new_expires_at"]
+        lease["revision"] = evt["revision"]
+
     elif t == "LeaseClosed":
         lease = p.leases[evt["lease_id"]]
         remaining = lease["amount"] - lease["consumed"]
@@ -339,6 +351,15 @@ def _require_int(value: Any, field: str, minimum: int | None = None) -> int:
     if minimum is not None and value < minimum:
         raise ValidationError(f"{field} 必须 >= {minimum}")
     return value
+
+
+def _require_timestamp(value: Any, field: str) -> float:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ValidationError(f"{field} 必须是 Unix 时间戳（秒）")
+    ts = float(value)
+    if not math.isfinite(ts):
+        raise ValidationError(f"{field} 必须是有限时间戳（秒）")
+    return ts
 
 
 def _get_active_lease(p: Projection, lease_id: Any) -> dict[str, Any]:
@@ -544,6 +565,67 @@ def handle_revoke(p: Projection, body: dict[str, Any]) -> list[dict[str, Any]]:
     return [_close_event(lease, "revoked")]
 
 
+def handle_amend(p: Projection, body: dict[str, Any]) -> list[dict[str, Any]]:
+    """租约有效期修订（乐观修订号 + 幂等命令）。
+
+    持有人提交预期修订号与更晚的截止时间；成功则修订号 +1。
+    与归还/撤销/到期清算在同一把锁内串行：任一变更先落入账本后，
+    本命令再校验时即看到最新状态并以 409 失败（错误信息携带现状）。
+    """
+    _require_bootstrap(p)
+    lease_id = body.get("lease_id")
+    if not lease_id or not isinstance(lease_id, str):
+        raise ValidationError("lease_id 必填")
+    expected_revision = _require_int(
+        body.get("expected_revision"), "expected_revision", 0
+    )
+    new_expires_at = _require_timestamp(body.get("new_expires_at"), "new_expires_at")
+
+    lease = p.leases.get(lease_id)
+    if lease is None:
+        raise NotFoundError(f"租约不存在: {lease_id}")
+
+    holder = p.nodes[lease["holder_id"]]
+    if holder["type"] == "client" and not holder["online"]:
+        raise ConflictError(
+            f"客户端 {lease['holder_id']} 已下线，不能修订租约 {lease_id} 的有效期"
+        )
+    if lease["status"] == "pending_expired":
+        raise ConflictError(
+            f"租约 {lease_id} 已到期，正在等待余量结算，不能修订有效期"
+        )
+    if lease["status"] != "active":
+        raise ConflictError(
+            f"租约 {lease_id} 已关闭（{lease['reason']}），不能修订有效期"
+        )
+    if expected_revision != lease["revision"]:
+        raise ConflictError(
+            f"修订号过旧：提交 {expected_revision}，当前 {lease['revision']}；"
+            "请读取最新状态后重试"
+        )
+    if lease["expires_at"] is None:
+        raise ConflictError(f"租约 {lease_id} 为永久租约（无截止时间），无法向后延长")
+    if new_expires_at <= lease["expires_at"]:
+        raise ConflictError(
+            f"目标时间未向后延长：当前截止 {lease['expires_at']:.3f}，"
+            f"提交 {new_expires_at:.3f}"
+        )
+
+    return [
+        {
+            "type": "LeaseExpiryAmended",
+            "payload": {
+                "lease_id": lease["id"],
+                "holder_id": lease["holder_id"],
+                "revision": lease["revision"] + 1,
+                "old_expires_at": lease["expires_at"],
+                "new_expires_at": new_expires_at,
+                "amended_at": time.time(),
+            },
+        }
+    ]
+
+
 def handle_presence(p: Projection, body: dict[str, Any]) -> list[dict[str, Any]]:
     _require_bootstrap(p)
     client_id = body.get("client_id")
@@ -646,6 +728,7 @@ HANDLERS = {
     "usage": handle_usage,
     "release": handle_release,
     "revoke": handle_revoke,
+    "amend": handle_amend,
     "presence": handle_presence,
 }
 
@@ -667,6 +750,12 @@ RESULT_EXTRACTORS = {
         "usage_event_id": pl["usage_event_id"],
     },
     "LeaseExpired": lambda pl: {"lease_id": pl["lease_id"], "marked_at": pl["marked_at"]},
+    "LeaseExpiryAmended": lambda pl: {
+        "lease_id": pl["lease_id"],
+        "revision": pl["revision"],
+        "old_expires_at": pl["old_expires_at"],
+        "new_expires_at": pl["new_expires_at"],
+    },
     "LeaseClosed": lambda pl: {
         "lease_id": pl["lease_id"],
         "reason": pl["reason"],

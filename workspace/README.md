@@ -16,7 +16,7 @@ python3 -m quota.http_server --port 8765 --db ./quota.db
 # 打开 http://localhost:8765/ 即为租约控制台
 ```
 
-跑测试（功能 / 并发 / 到期 / 离线 / 重启重建 / 账本篡改，共 70 项）：
+跑测试（功能 / 并发 / 到期 / 离线 / 有效期修订 / 重启重建 / 账本篡改，共 103 项）：
 
 ```bash
 python3 test_service.py
@@ -46,6 +46,7 @@ HTTP (http_server.py)
 | `LeaseGranted` | 父子节点间授予一条租约 |
 | `UsageRecorded` | 幂等用量回执，按 `usage_event_id` 去重 |
 | `LeaseExpired` | 租约到期，标记 `pending_expired`（不动余额） |
+| `LeaseExpiryAmended` | 延长租约截止时间，修订号 +1（不动余额） |
 | `LeaseClosed` | 结算租约，退回未消费余量 |
 | `ClientPresenceChanged` | 客户端上 / 下线 |
 
@@ -81,6 +82,22 @@ HTTP (http_server.py)
 这样中间层到期永远不会引发跨层超卖；重启后待结算租约会在重放+sweep 时
 继续走完结算。
 
+### 有效期修订（乐观修订号）
+
+持有人通过 `POST /api/leases/amend` 提交**预期修订号**与**更晚的截止时间**：
+校验通过则 `LeaseExpiryAmended` 落入账本、修订号 +1；相同 `command_id`
+（或 `Idempotency-Key`）重放返回首次结果，不重复递增。以下情况返回 `409`，
+错误信息携带当前修订号 / 状态，便于失败后重读最新状态再试：
+
+- 修订号过旧（与当前不一致）；
+- 租约已关闭或已到期等待结算；
+- 持有人客户端已下线；
+- 目标时间未向后延长（永久租约无截止时间，同样拒绝）。
+
+修订与归还 / 撤销 / 定时清算在同一把锁内串行执行（先 sweep 再校验再原子
+提交），并发竞争时只有先落入账本的变更生效。修订号、截止时间与全部变更
+历史都在事件账本中，进程重启后重放即可恢复。
+
 ### 防超卖 / 一致性的四道防线
 
 1. **进程内串行**：所有命令在同一把锁内“到期结算 → 去重 → 校验 → 原子提交”；
@@ -103,6 +120,7 @@ HTTP (http_server.py)
 | `POST /api/leases/usage` | `{lease_id, amount, usage_event_id}` 幂等扣减 |
 | `POST /api/leases/release` | `{lease_id}` 归还（释放未消费） |
 | `POST /api/leases/revoke` | `{lease_id}` 父级撤销 / 缩容 |
+| `POST /api/leases/amend` | `{lease_id, expected_revision, new_expires_at}` 修订有效期 |
 | `POST /api/clients/presence` | `{client_id, online}` 上 / 下线 |
 | `GET /api/state` | 全量节点余额 + 租约视图 |
 | `GET /api/audit` | 一致性审计（见下） |
@@ -130,4 +148,4 @@ HTTP (http_server.py)
 | `quota/service.py` | 命令执行 / 幂等 / 重建 / 后台 sweep / 审计 |
 | `quota/http_server.py` | HTTP 路由与静态页面 |
 | `static/index.html` | 租约控制台（节点树、租约操作、审计、账本） |
-| `test_service.py` | 70 项端到端测试（含真实重启与并发） |
+| `test_service.py` | 103 项端到端测试（含真实重启与并发） |

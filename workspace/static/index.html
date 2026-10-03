@@ -205,7 +205,7 @@
 
   <!-- 租约表 -->
   <section class="card">
-    <h2>④ 租约与用量 <em>消费按 usage_event_id 幂等；归还/撤销/到期/离线只退未消费余量</em></h2>
+    <h2>④ 租约与用量 <em>消费按 usage_event_id 幂等；归还/撤销/到期/离线只退未消费余量；延期按预期修订号乐观并发</em></h2>
     <div style="overflow-x:auto">
       <table id="lease-table">
         <thead>
@@ -387,7 +387,7 @@ function renderLeases(s) {
     const tr = document.createElement("tr");
     if (l.status === "closed") tr.className = "closed";
     const td = (txt, cls) => { const c = document.createElement("td"); if (cls) c.className = cls; c.textContent = txt; return c; };
-    tr.appendChild(td(l.id.slice(0, 14)));
+    tr.appendChild(td(l.id.slice(0, 14) + (l.revision ? ` · v${l.revision}` : "")));
     tr.appendChild(td(`${l.lessor_id} → ${l.holder_id}`));
     tr.appendChild(td(l.amount, "num"));
     tr.appendChild(td(l.consumed, "num"));
@@ -429,6 +429,27 @@ function renderLeases(s) {
         } catch (e) { toast(e.message, false); }
       };
       wrap.appendChild(useBtn);
+      if (l.expires_at !== null && l.expires_at !== undefined) {
+        const ext = document.createElement("input");
+        ext.type = "number"; ext.min = "1"; ext.placeholder = "延长秒";
+        ext.style.width = "72px";
+        wrap.appendChild(ext);
+        const extBtn = document.createElement("button");
+        extBtn.className = "ghost"; extBtn.textContent = "延期";
+        extBtn.onclick = async () => {
+          const secs = parseInt(ext.value, 10);
+          if (!secs || secs < 1) return toast("请输入要延长的秒数", false);
+          try {
+            const r = await api("/api/leases/amend", {
+              lease_id: l.id, expected_revision: l.revision,
+              new_expires_at: l.expires_at + secs, command_id: uid("amend"),
+            });
+            toast(`租约 ${l.id} 已延长至 ${fmtTime(r.new_expires_at)}（修订号 v${r.revision}）`);
+            refreshAll();
+          } catch (e) { toast("延期被拒绝：" + e.message, false); refreshAll(); }
+        };
+        wrap.appendChild(extBtn);
+      }
       const rel = document.createElement("button");
       rel.className = "ghost"; rel.textContent = "归还";
       rel.onclick = async () => {
